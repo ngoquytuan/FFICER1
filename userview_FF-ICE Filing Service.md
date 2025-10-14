@@ -259,3 +259,216 @@ curl http://localhost:8080/api/v1/filing/logs
 ---
 
 Bạn có muốn tôi minh họa **toàn bộ quy trình xử lý test_fixm.xml** này bằng một **sequence diagram (sơ đồ tuần tự)** để bạn dùng trong tài liệu vận hành không?
+
+Xuất sắc 👨‍✈️ — dưới đây là **Mermaid sequence diagram** mô phỏng **quy trình xử lý điện văn eFPL (test_fixm.xml)** trong Filing Service của bạn,
+đứng từ **góc nhìn người dùng (Airline Dispatcher)** gửi kế hoạch bay đến **hệ thống FF-ICE Filing Service (stand-alone)**.
+
+---
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant User as 🧑‍✈️ Airline Dispatcher (User)
+    participant API as 🛰️ Filing Service API (REST)
+    participant Validator as 🧩 FIXM Validator
+    participant Rules as ⚙️ Rule Engine
+    participant DB as 🗄️ Database (flight_plans & validation_log)
+    participant Resp as 📩 ACK/NACK Generator
+
+    %% User sends request
+    User->>API: POST /api/v1/filing/submit\nwith test_fixm.xml (JSON)
+    API->>DB: Insert initial log (status=PENDING)
+    
+    %% FIXM Validation
+    API->>Validator: Validate XML schema (fixm.xsd)
+    Validator-->>API: ✅ Valid / ❌ Invalid
+
+    %% Business Rules
+    API->>Rules: Check ICAO codes, ETD<ETA, flightNumber
+    Rules-->>API: ✅ OK / ❌ Rule violation
+
+    %% Decision branch
+    alt XML or Business Invalid
+        API->>DB: Update validation_log (status=REJECTED)
+        API->>Resp: Generate NACK JSON
+        Resp-->>User: HTTP 400\n{"status":"REJECTED", "message":"Invalid FIXM XML"}
+    else All valid
+        API->>DB: Insert flight_plan (status=FILED)
+        API->>DB: Update validation_log (status=ACCEPTED)
+        API->>Resp: Generate ACK JSON
+        Resp-->>User: HTTP 200\n{"status":"ACCEPTED","gufi":"VN123-..."}
+    end
+
+    %% Optional follow-up
+    User->>API: GET /api/v1/filing/{gufi}
+    API->>DB: Fetch flight_plan
+    DB-->>User: FlightPlan details (JSON)
+```
+
+---
+
+### 📘 Giải thích luồng
+
+| # | Giai đoạn               | Mô tả chi tiết                                                          |
+| - | ----------------------- | ----------------------------------------------------------------------- |
+| 1 | **User gửi điện văn**   | Bạn gửi `test_fixm.xml` chứa eFPL qua REST API.                         |
+| 2 | **Hệ thống ghi log**    | Filing Service ghi bản ghi `validation_log` với status PENDING.         |
+| 3 | **Kiểm tra FIXM**       | Xác thực XML theo `fixm.xsd` — nếu lỗi cấu trúc thì reject ngay.        |
+| 4 | **Kiểm tra nghiệp vụ**  | Áp dụng Rule Engine: ICAO code, ETD/ETA, định dạng số hiệu chuyến bay.  |
+| 5 | **Lưu kế hoạch hợp lệ** | Nếu hợp lệ → lưu vào bảng `flight_plans`, status = FILED.               |
+| 6 | **Phản hồi người dùng** | Gửi ACK (ACCEPTED) hoặc NACK (REJECTED) kèm timestamp.                  |
+| 7 | **Tra cứu lại FPL**     | Người dùng có thể dùng GET /filing/{gufi} để xem lại điện văn đã filed. |
+
+---
+
+Bạn có muốn tôi vẽ thêm **Mermaid diagram kiến trúc tổng thể** (toàn hệ thống Filing Service + SWIM Adapter + DB + Security layer) cho giai đoạn **P5** luôn không?
+→ Nó sẽ giúp bạn trình bày trong tài liệu kỹ thuật hoặc báo cáo ICAO conformance test.
+
+Tuyệt vời 👨‍✈️ — đây chính là **sơ đồ kiến trúc tổng thể giai đoạn P5**,
+thể hiện toàn bộ hệ thống **FF-ICE/R1 Filing Service** khi đã mở rộng đầy đủ các thành phần chuẩn **ICAO SWIM** (bao gồm SOAP Adapter, Security Layer, và cơ sở dữ liệu).
+
+---
+
+## 🧭 **FF-ICE/R1 – Filing Service: Overall Architecture (P5 – SWIM-ready)**
+
+```mermaid
+graph TB
+    %% =====================
+    %% CLIENT SIDE
+    %% =====================
+    subgraph CLIENT["🛫 Airline / Dispatcher / ATC Client"]
+        A1["🧑‍✈️ Operator\n(Submits eFPL)"]
+        A2["✉️ eFPL (FIXM XML)"]
+        A1 --> A2
+    end
+
+    %% =====================
+    %% SWIM LAYER
+    %% =====================
+    subgraph SWIM_GATEWAY["🛰️ SWIM Gateway (SOAP / HTTPS)"]
+        SG1["SOAP Adapter\n(WSDL: FilingService.wsdl)"]
+        SG2["Security Module\n(X.509 Mutual TLS + WS-Security)"]
+        SG3["Message Router\n(Solace / AMQP / JMS)"]
+        SG1 --> SG2 --> SG3
+    end
+
+    %% =====================
+    %% FILING SERVICE CORE
+    %% =====================
+    subgraph FILING_CORE["🧩 Filing Service Core (Spring Boot)"]
+        FS1["API Controller\n(/api/v1/filing/submit)"]
+        FS2["FIXM Validator\n(XML Schema Validation)"]
+        FS3["Rule Engine\n(Business Logic Checks)"]
+        FS4["ACK/NACK Generator"]
+        FS5["Security Filter\n(JWT / HTTPS)"]
+        FS6["Logger & Audit Trail"]
+        FS7["REST Adapter (for testing)"]
+
+        FS1 --> FS2 --> FS3 --> FS4
+        FS1 --> FS5
+        FS4 --> FS6
+        FS1 --> FS7
+    end
+
+    %% =====================
+    %% DATABASE LAYER
+    %% =====================
+    subgraph DATABASE["🗄️ Database Layer"]
+        DB1["PostgreSQL\n(flight_plans)"]
+        DB2["Validation Log\n(validation_log)"]
+        DB3["User Auth / Tokens"]
+        DB1 --> DB2
+    end
+
+    %% =====================
+    %% SECURITY INFRASTRUCTURE
+    %% =====================
+    subgraph SECURITY["🔐 Security Infrastructure"]
+        S1["X.509 Certificates"]
+        S2["JWT Token Provider"]
+        S3["HTTPS (TLS1.3) Reverse Proxy\n(Nginx / Keycloak Gateway)"]
+        S1 --> S2 --> S3
+    end
+
+    %% =====================
+    %% INTERACTIONS
+    %% =====================
+    A2 -->|SOAP/HTTPS Request| SG1
+    SG3 -->|Transforms to REST| FS1
+    FS3 -->|Write Result| DB1
+    FS3 -->|Write Log| DB2
+    FS4 -->|ACK/NACK Response| SG3
+    FS5 --> S2
+    S3 --> FS1
+```
+
+---
+
+## 🧩 **Giải thích chi tiết các lớp**
+
+| Lớp                        | Vai trò                                           | Chuẩn ICAO tương ứng           |
+| -------------------------- | ------------------------------------------------- | ------------------------------ |
+| **🛫 Client**              | Nơi hãng hàng không nộp eFPL (FIXM XML)           | FF-ICE Filer                   |
+| **🛰️ SWIM Gateway**       | Lớp trung gian SOAP/HTTPS, xác thực và định tuyến | ICAO SWIM Core Profile         |
+| **🧩 Filing Service Core** | Thực thi nghiệp vụ Filing, validation và phản hồi | FF-ICE/R1 Mandatory Service #1 |
+| **🗄️ Database Layer**     | Lưu trữ flight plan, log, user token              | FIXM Store / Filing Archive    |
+| **🔐 Security Layer**      | Cung cấp xác thực, mã hoá, ký điện tử             | WS-Security + TransportBinding |
+
+---
+
+## 🔐 **Luồng dữ liệu chuẩn ICAO (SOAP + WS-Security)**
+
+```mermaid
+sequenceDiagram
+    participant Client as 🧑‍✈️ Airline Dispatcher
+    participant SWIM as 🛰️ SWIM Gateway
+    participant Filing as 🧩 Filing Service Core
+    participant DB as 🗄️ PostgreSQL DB
+
+    Client->>SWIM: Submit eFPL (SOAP over HTTPS)\nSigned with X.509
+    SWIM->>Filing: Forward to REST API (/filing/submit)
+    Filing->>Filing: Validate FIXM XML
+    Filing->>Filing: Apply Rule Engine (ICAO business rules)
+    alt Valid
+        Filing->>DB: Store FlightPlan (status=FILED)
+        Filing-->>SWIM: ACK Message (WS-Security Signed)
+        SWIM-->>Client: <Ack status="ACCEPTED"/>
+    else Invalid
+        Filing->>DB: Log validation error
+        Filing-->>SWIM: NACK Message (reason)
+        SWIM-->>Client: <Ack status="REJECTED"/>
+    end
+```
+
+---
+
+## 📘 **Các điểm mở rộng trong giai đoạn P5**
+
+| Thành phần              | Mục tiêu                                 | Công nghệ gợi ý            |
+| ----------------------- | ---------------------------------------- | -------------------------- |
+| **SOAP Adapter**        | Giao tiếp với SWIM theo WSDL + WS-Policy | Spring Web Services        |
+| **WS-Security (X.509)** | Ký và mã hóa điện văn                    | WSS4J / KeyStore JKS       |
+| **JWT Layer**           | Xác thực REST client                     | Spring Security + jose-jwt |
+| **HTTPS Gateway**       | Reverse proxy TLS1.3                     | Nginx hoặc Keycloak        |
+| **Monitoring**          | Giám sát lưu lượng                       | Prometheus + Grafana       |
+| **Message Broker**      | SWIM router (Solace / RabbitMQ)          | JMS / AMQP / MQTT          |
+
+---
+
+## ✅ **Kết quả giai đoạn P5**
+
+| Hệ thống con        | Trạng thái           | Chuẩn ICAO          |
+| ------------------- | -------------------- | ------------------- |
+| Filing Service REST | ✅ Hoạt động ổn định  | FF-ICE/R1           |
+| FIXM Validator      | ✅ Đúng schema        | FIXM 4.2.0          |
+| Rule Engine         | ✅ Kiểm tra nghiệp vụ | FF-ICE/R1 Logic     |
+| SOAP Adapter        | ⚙️ Bắt đầu tích hợp  | SWIM SOAP Profile   |
+| WS-Security         | ⚙️ Có chữ ký X.509   | WS-Policy 1.2       |
+| Database & Logs     | ✅ Ghi đầy đủ         | Audit compliance    |
+| SWIM Integration    | 🔜 (P6)              | SWIM Yellow Profile |
+
+---
+
+Bạn có muốn tôi sinh luôn **mẫu WSDL (FilingService.wsdl)** kèm **WS-Policy đoạn sp:TransportBinding + sp:SignedParts** để bạn bước vào **P6: SWIM SOAP Adapter** không?
+(đây là phần ICAO yêu cầu để nộp conformance test cho Filing Service).
+
