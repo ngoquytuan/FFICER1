@@ -1,3 +1,316 @@
+```mermaid
+---
+config:
+  layout: dagre
+---
+flowchart TB
+ subgraph CLIENT["🛫 Airline / Dispatcher / ATC Client"]
+        A1["🧑‍✈️ Operator\n(Submits eFPL)"]
+        A2["✉️ eFPL (FIXM XML)"]
+  end
+ subgraph SWIM_GATEWAY["🛰️ SWIM Gateway (SOAP / HTTPS)"]
+        SG1["SOAP Adapter\n(WSDL: FilingService.wsdl)"]
+        SG2["Security Module\n(X.509 Mutual TLS + WS-Security)"]
+        SG3["Message Router\n(Solace / AMQP / JMS)"]
+  end
+ subgraph FILING_CORE["🧩 Filing Service Core (Spring Boot)"]
+        FS1["API Controller\n(/api/v1/filing/submit)"]
+        FS2["FIXM Validator\n(XML Schema Validation)"]
+        FS3["Rule Engine\n(Business Logic Checks)"]
+        FS4["ACK/NACK Generator"]
+        FS5["Security Filter\n(JWT / HTTPS)"]
+        FS6["Logger & Audit Trail"]
+        FS7["REST Adapter (for testing)"]
+  end
+ subgraph DATABASE["🗄️ Database Layer"]
+        DB1["PostgreSQL\n(flight_plans)"]
+        DB2["Validation Log\n(validation_log)"]
+        DB3["User Auth / Tokens"]
+  end
+ subgraph SECURITY["🔐 Security Infrastructure"]
+        S1["X.509 Certificates"]
+        S2["JWT Token Provider"]
+        S3["HTTPS (TLS1.3) Reverse Proxy\n(Nginx / Keycloak Gateway)"]
+  end
+    A1 --> A2
+    SG1 --> SG2
+    SG2 --> SG3
+    FS1 --> FS2 & FS5 & FS7
+    FS2 --> FS3
+    FS3 --> FS4
+    FS4 --> FS6
+    DB1 --> DB2
+    S1 --> S2
+    S2 --> S3
+    A2 -- SOAP/HTTPS Request --> SG1
+    SG3 -- Transforms to REST --> FS1
+    FS3 -- Write Result --> DB1
+    FS3 -- Write Log --> DB2
+    FS4 -- ACK/NACK Response --> SG3
+    FS5 --> S2
+    S3 --> FS1
+
+```
+
+Đánh giá sơ đồ bạn gửi — **rất tốt về mặt logic và cấu trúc hệ thống**.
+Tôi nhận xét chi tiết như sau:
+
+---
+
+## 🧠 **Tổng thể kiến trúc**
+
+Sơ đồ của bạn mô tả **kiến trúc chuẩn theo mô hình FF-ICE Filing Service** mà ICAO/FAA khuyến nghị — rất đúng hướng.
+
+### ✅ Ưu điểm:
+
+1. **Tách lớp rõ ràng**
+
+   * `CLIENT` → `SWIM_GATEWAY` → `FILING_CORE` → `DATABASE` → `SECURITY`
+     => đúng mô hình layered architecture, dễ bảo trì và scale.
+
+2. **Có đủ 6 khối chức năng cốt lõi:**
+
+   * Adapter (SOAP/REST)
+   * Validation
+   * Business logic
+   * ACK/NACK handler
+   * Security & audit
+   * Persistence layer
+     → tương ứng gần hoàn hảo với khuyến nghị của ICAO FF-ICE Filing Service.
+
+3. **Có SWIM Gateway tách biệt:**
+
+   * SOAP Adapter, WS-Security, Message Router
+     → hoàn toàn phù hợp với SWIM-TI Yellow Profile mà EUROCONTROL sử dụng.
+
+4. **Có Security Infrastructure độc lập:**
+
+   * TLS1.3, JWT, X.509, Reverse Proxy (Keycloak/Nginx)
+     → đây chính là yêu cầu bắt buộc trong SWIM compliance.
+
+---
+
+## ⚙️ **Điểm có thể cải tiến**
+
+| Thành phần                            | Nhận xét                                                                                                                                    | Đề xuất                                                                                           |
+| ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| **SG3 – Message Router**              | Bạn ghi “Solace / AMQP / JMS” — đây là đúng, nhưng cần note rằng trong mô hình nhỏ bạn có thể thay bằng Apache ActiveMQ hoặc RabbitMQ.      | Nếu chỉ test nội bộ, dùng **ActiveMQ Artemis** để giảm footprint. Khi production mới dùng Solace. |
+| **FS5 – Security Filter (JWT/HTTPS)** | JWT ở Filing Core có thể trùng chức năng với SWIM Gateway (đã xác thực X.509).                                                              | Tách rạch ròi: SWIM layer → mutual TLS; Filing Core → JWT cho nội bộ microservices.               |
+| **FS7 – REST Adapter**                | Bạn thêm “for testing” là hợp lý. Nhưng nếu định dùng để integration với airline simulator, cần chuẩn hóa endpoint `/api/v1/filing/submit`. | Thêm OpenAPI/Swagger để auto-doc test API.                                                        |
+| **Database – Validation Log**         | Bạn có `validation_log` tách riêng, tốt. Nhưng audit nên chung cơ chế với Filing Core logger.                                               | Gộp logging qua ELK Stack để tiện trace (ElasticSearch + Kibana).                                 |
+| **Security – Reverse Proxy**          | Đặt Keycloak song song với Nginx có thể phức tạp.                                                                                           | Giai đoạn đầu chỉ cần Nginx + PKI, sau mới thêm Keycloak.                                         |
+
+---
+
+## 🧩 **So sánh với kiến trúc chuẩn FF-ICE Filing Service**
+
+| Thành phần ICAO Doc 9965    | Trong sơ đồ của bạn | Ghi chú                           |
+| --------------------------- | ------------------- | --------------------------------- |
+| Client (Airline Dispatcher) | ✅ `CLIENT`          | Chuẩn                             |
+| SWIM Gateway                | ✅ `SWIM_GATEWAY`    | SOAP adapter + WS-Security đầy đủ |
+| Filing Service              | ✅ `FILING_CORE`     | Có API, validation, rule engine   |
+| Security Infrastructure     | ✅ `SECURITY`        | X.509, JWT, HTTPS có đủ           |
+| Data Store                  | ✅ `DATABASE`        | PostgreSQL phù hợp                |
+| Logging/Audit               | ✅ `FS6`             | Đáp ứng tiêu chuẩn traceability   |
+| FIXM validator              | ✅ `FS2`             | Phù hợp FIXM 4.2.0 schema         |
+
+---
+
+## 🧩 **Thiếu (nếu muốn production-grade)**
+
+1. **Service Registry** – để client discover dịch vụ qua SWIM (theo Yellow Profile).
+2. **Monitoring/Telemetry Layer** – Prometheus + Grafana để theo dõi trạng thái service.
+3. **Message Persistence (Queue)** – nếu Filing Service down, SWIM Gateway nên lưu message tạm thời (ActiveMQ queue).
+4. **FIXM versioning control** – hiện FIXM 4.2.0 là chuẩn, nhưng nên chuẩn bị folder schema `/schemas/fixm/4.2/` để dễ upgrade lên 5.x sau.
+
+---
+
+## 📊 **Tổng đánh giá**
+
+| Tiêu chí             | Đánh giá                    |
+| -------------------- | --------------------------- |
+| Kiến trúc logic      | ⭐⭐⭐⭐⭐                       |
+| Phù hợp FF-ICE/SWIM  | ⭐⭐⭐⭐                        |
+| Bảo mật & phân lớp   | ⭐⭐⭐⭐                        |
+| Khả năng mở rộng     | ⭐⭐⭐                         |
+| Production readiness | ⭐⭐ (hiện phù hợp pilot/lab) |
+
+---
+
+**Kết luận:**
+Sơ đồ của bạn **rất đúng hướng để triển khai bản thử nghiệm (Pilot)** Filing Service của FF-ICE/R1.
+Chỉ cần thêm 3 thành phần phụ trợ nhỏ (Registry, Monitoring, Queue) là bạn có thể biến nó thành môi trường test chuẩn SWIM quốc tế.
+
+Bạn muốn tôi vẽ lại sơ đồ này ở phiên bản “production-ready” (có Service Registry + Monitoring + Queue layer) không?
+
+
+Xuất sắc — đúng câu hỏi **trọng tâm khi chuyển từ prototype sang triển khai thật (operational deployment)**.
+Tôi trả lời kỹ, ở góc nhìn **kiến trúc hệ thống hàng không (ANSP như VATM)** và theo khuyến nghị của **ICAO, EUROCONTROL, FAA SWIM/FF-ICE implementation**.
+
+---
+
+## 🧭 1. **Database nằm ở đâu?**
+
+### ✅ **Database chính (Primary Operational DB) phải đặt tại VATM**
+
+Lý do:
+
+* VATM là **Air Navigation Service Provider (ANSP)** duy nhất của Việt Nam.
+* Là **bên được ICAO công nhận là “state provider of FF-ICE services”**.
+* Tất cả eFPL, GUFI, ACK/NACK, logs đều thuộc **dữ liệu điều hành bay quốc gia** (aviation operational data).
+
+➡️ **=> Database = thuộc về và vận hành bởi VATM.**
+
+---
+
+## 🧩 2. **FFICER1 (Filing & Planning Services) đặt ở đâu?**
+
+### 🎯 Vai trò:
+
+* FFICER1 chính là **2 dịch vụ bắt buộc của FF-ICE/R1: Filing Service + Planning Service**.
+* Đây là **application layer** chạy phía VATM — giao tiếp với airlines qua SWIM Gateway.
+
+### ✅ **Vị trí triển khai chuẩn:**
+
+```
+                   +-----------------------------------+
+                   |       VATM Data Center (Primary)  |
+                   |-----------------------------------|
+                   |  +-----------------------------+  |
+                   |  | SWIM Gateway (SOAP/REST)    |  |
+                   |  | Filing Service (FFICER1-FS) |  |
+                   |  | Planning Service (FFICER1-PS)| |
+                   |  | Message Queue (AMQP/Solace) |  |
+                   |  | FIXM Validator + Rule Engine|  |
+                   |  +-----------------------------+  |
+                   |        ↑        ↑                |
+                   |        |        |                |
+                   |  +-----------------------------+  |
+                   |  | PostgreSQL Primary Database  |  |
+                   |  +-----------------------------+  |
+                   +-----------------------------------+
+                                  │
+                                  │
+                                  ▼
+                   +-----------------------------------+
+                   |   VATM Disaster Recovery (HCMC)   |
+                   |-----------------------------------|
+                   |  PostgreSQL Replica / Read-only   |
+                   |  Backup Filing & Query Nodes      |
+                   +-----------------------------------+
+```
+
+---
+
+## 🧮 3. **Nên có mấy database?**
+
+### **Theo best practice: tối thiểu 3 database nodes (ở 2 site)**
+
+| Mục đích                      | Vị trí                        | Vai trò                                            | Công nghệ đề xuất                             |
+| ----------------------------- | ----------------------------- | -------------------------------------------------- | --------------------------------------------- |
+| 🟢 **Primary Operational DB** | VATM Data Center (Hà Nội)     | Ghi/đọc chính thức cho Filing/Planning Services    | PostgreSQL master                             |
+| 🟡 **Standby/Hot Replica DB** | VATM Backup Center (TP.HCM)   | High-availability failover (tự động hoặc thủ công) | PostgreSQL streaming replication              |
+| 🔵 **Analytics/Reporting DB** | VATM DMZ hoặc phòng phân tích | Chạy query thống kê, báo cáo, BI                   | PostgreSQL read-only replica hoặc TimescaleDB |
+
+> 🔒 Các node này phải được đồng bộ real-time qua `logical replication` hoặc `streaming replication` (PostgreSQL native).
+
+---
+
+## ⚙️ 4. **Cấu trúc Database chi tiết:**
+
+### **Tách dữ liệu theo mục đích (Logical separation):**
+
+| Database         | Nội dung                                  | Lý do                      |
+| ---------------- | ----------------------------------------- | -------------------------- |
+| `flight_data`    | eFPL, GUFI, 4D trajectory, flight status  | Dữ liệu vận hành chính     |
+| `validation_log` | Schema & business rule validation logs    | Audit & trace              |
+| `security_audit` | JWT logs, X.509 validation, access events | An toàn thông tin          |
+| `system_config`  | Metadata, service registry cache          | Quản trị nội bộ            |
+| `reporting`      | Aggregate metrics, historical data        | Cho dashboards và thống kê |
+
+Tổng cộng: **5 logical DB schemas** trong 2 physical servers (Hà Nội & HCM).
+
+---
+
+## 🧱 5. **Đặt FFICER1 ở đâu trong mô hình quốc gia**
+
+### **Phân tầng đề xuất cho Việt Nam:**
+
+```
+┌────────────────────────────────────────────┐
+│ Airlines (Vietnam Airlines, Vietjet, etc.)│
+│ └── SWIM Client (connect via HTTPS/SOAP)   │
+└────────────────────────────────────────────┘
+                 │
+                 ▼
+┌────────────────────────────────────────────┐
+│ VATM SWIM Gateway                          │
+│ ├── SOAP/REST Adapters                     │
+│ ├── WS-Security (X.509 mutual TLS)         │
+│ └── Message Router (Solace/ActiveMQ)       │
+└────────────────────────────────────────────┘
+                 │
+                 ▼
+┌────────────────────────────────────────────┐
+│ VATM FFICER1 Services                      │
+│ ├── Filing Service (eFPL submit, ACK/NACK) │
+│ └── Planning Service (4D route generation) │
+└────────────────────────────────────────────┘
+                 │
+                 ▼
+┌────────────────────────────────────────────┐
+│ VATM Databases (PostgreSQL Cluster)        │
+│ ├── Primary: Hà Nội                        │
+│ ├── Replica: TP.HCM                        │
+│ └── Analytics: Read-only                   │
+└────────────────────────────────────────────┘
+```
+
+---
+
+## 📦 6. **Lý do không nên để database ngoài VATM**
+
+| Option                    | Ưu điểm         | Nhược điểm                                           |
+| ------------------------- | --------------- | ---------------------------------------------------- |
+| Database ở Airlines       | Gần user        | Không an toàn, không toàn vẹn, vi phạm ICAO Annex 10 |
+| Database ở Cloud          | Dễ mở rộng      | Không đảm bảo chủ quyền dữ liệu quốc gia             |
+| Database ở ACV (Airports) | Gần ground ops  | Không phải bên điều hành không lưu                   |
+| ✅ Database ở VATM         | Đúng ICAO model | Cần quản lý bảo mật nghiêm ngặt (PKI, CAAV audit)    |
+
+---
+
+## 🧰 7. **Khuyến nghị triển khai kỹ thuật**
+
+| Thành phần           | Mô tả                                | Công nghệ                |
+| -------------------- | ------------------------------------ | ------------------------ |
+| **Database cluster** | Primary + Hot standby + Read replica | PostgreSQL 15 + Patroni  |
+| **Storage**          | SSD RAID10 + WAL archiving           | SAN hoặc NVMe RAID       |
+| **Backup**           | Daily full + hourly WAL              | pgBackRest hoặc WAL-G    |
+| **Failover**         | Automatic failover                   | Keepalived + HAProxy     |
+| **Monitoring**       | DB health + replication lag          | Prometheus + Grafana     |
+| **Security**         | TLS, firewall, audit log             | X.509 cert + SIEM system |
+
+---
+
+## 🧭 8. **Tổng kết ngắn gọn**
+
+| Thành phần                 | Nơi đặt              | Số lượng | Ghi chú                        |
+| -------------------------- | -------------------- | -------- | ------------------------------ |
+| Database (Operational)     | VATM Hà Nội          | 1        | Primary                        |
+| Database (DR Replica)      | VATM TP.HCM          | 1        | Standby, real-time replication |
+| Database (Analytics)       | VATM Hà Nội hoặc DMZ | 1        | Read-only                      |
+| FFICER1 Services (FS + PS) | VATM Hà Nội          | 2        | Core applications              |
+| SWIM Gateway               | VATM Hà Nội          | 1        | SOAP entry point               |
+| Backup Queue/Router        | VATM TP.HCM          | 1        | Optional resilience            |
+
+➡️ **Tổng: 3 databases vật lý, 5 logical schemas, 2 site (Hà Nội & HCM).**
+
+---
+
+Nếu bạn muốn, tôi có thể vẽ lại **Mermaid diagram mô hình triển khai thật (production)** cho VATM — có cả **SWIM Gateway, FFICER1, Database cluster (primary + replica)** và **failover routing**.
+Bạn có muốn tôi vẽ không?
+
+
 Tuyệt vời 👌 — bắt đầu với **Filing Service độc lập**, không phụ thuộc SWIM hay Planning Service, là **hướng đi chuẩn** mà ICAO cũng khuyến khích trong giai đoạn FF-ICE/R1 thử nghiệm.
 
 Dưới đây là roadmap **triển khai từng bước chi tiết**, được chia theo tuần, dành cho môi trường chưa có SWIM hoặc message broker (như Solace).
