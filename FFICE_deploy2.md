@@ -1,3 +1,407 @@
+👏 Câu hỏi cực chuẩn — bạn đang nắm đúng bản chất **kiến trúc kết nối B2B trong FF-ICE/SWIM**.
+Tôi xác nhận: **đúng về nguyên lý**, nhưng tôi sẽ giải thích kỹ hơn để bạn thấy rõ cơ chế thật trong triển khai quốc gia.
+
+---
+
+## 🧭 1. **Nguyên lý tổng thể**
+
+### ✅ Đúng:
+
+Các **Airlines (Vietnam Airlines, Vietjet, Bamboo, Vietravel…)**
+sẽ **kết nối đến hạ tầng SWIM của VATM** thông qua **SWIM Client Software**,
+dùng giao thức **HTTPS (REST)** hoặc **SOAP (WSDL)** tuân thủ ICAO SWIM Yellow Profile.
+
+### 🔁 Và họ **sẽ gọi các dịch vụ FF-ICE/R1 (FFICER1)** đang **chạy trong hạ tầng VATM**, cụ thể là:
+
+* **Filing Service** – để gửi eFPL
+* **Planning Service** – để lấy đề xuất trajectory hoặc xác nhận kế hoạch
+
+---
+
+## 🛰️ 2. **Đường đi thực tế của kết nối**
+
+### ⚙️ Kiến trúc chuẩn khi đi vào hoạt động:
+
+```mermaid
+flowchart LR
+    subgraph Airlines["✈️ Airline Systems (VNA, VJ, QH, etc.)"]
+        A1["Flight Planning Software"]
+        A2["SWIM Client (HTTPS/SOAP + X.509)"]
+    end
+
+    subgraph Network["🌐 Secure Network"]
+        N1["Internet/MPLS VPN (TLS1.3)"]
+    end
+
+    subgraph VATM_SWIM["🛰️ VATM SWIM Infrastructure"]
+        G1["SWIM Gateway (SOAP Adapter + WS-Security)"]
+        G2["Message Router (Solace / ActiveMQ)"]
+    end
+
+    subgraph FFICER1["🧩 FFICER1 Services Cluster (VATM)"]
+        F1["Filing Service Node"]
+        F2["Planning Service Node"]
+    end
+
+    subgraph DATABASE["🗄️ PostgreSQL Cluster"]
+        D1["Primary DB (Hà Nội)"]
+        D2["Replica DB (TP.HCM)"]
+    end
+
+    A1 --> A2 --> N1 --> G1 --> G2 --> F1 & F2 --> D1 --> D2
+```
+
+**➡️ Nghĩa là:**
+Airline **không truy cập trực tiếp vào Database**,
+mà chỉ **gửi SOAP/HTTPS requests** qua SWIM Gateway, rồi VATM **định tuyến đến 1 trong các node FFICER1**.
+
+---
+
+## 🧱 3. **Ba máy chủ bạn nhắc tới thực ra có vai trò khác nhau**
+
+| Máy chủ                      | Vai trò                                | Airlines có truy cập trực tiếp không?                              |
+| ---------------------------- | -------------------------------------- | ------------------------------------------------------------------ |
+| 🟢 **Application Server #1** | Chạy Filing Service                    | ✅ Có thể truy cập qua SWIM Gateway                                 |
+| 🟢 **Application Server #2** | Chạy Planning Service                  | ✅ Có thể truy cập qua SWIM Gateway                                 |
+| 🔵 **Database Server**       | PostgreSQL cluster (primary + replica) | ❌ Không trực tiếp — chỉ Filing/Planning Service được phép truy cập |
+
+👉 Airlines **chỉ kết nối tới SWIM Gateway layer**,
+còn Gateway layer sẽ định tuyến nội bộ đến **1 trong 2 node ứng dụng FFICER1** (FS hoặc PS).
+
+---
+
+## 🔐 4. **Cách định tuyến kết nối**
+
+### 🔄 **Load balancing / high availability:**
+
+* SWIM Gateway có thể chạy **Nginx / HAProxy / Solace router** để chia tải.
+* Airlines sẽ chỉ thấy **một endpoint duy nhất**:
+
+  ```
+  https://swim.vatm.vn/services/FilingService
+  https://swim.vatm.vn/services/PlanningService
+  ```
+* Còn bên trong, Gateway sẽ định tuyến:
+
+  ```
+  FilingService → Application Node 1 (Hà Nội)
+                 → hoặc Node 2 (TP.HCM – standby)
+  ```
+
+---
+
+## 🧩 5. **Luồng dữ liệu cụ thể (VD: Vietnam Airlines gửi eFPL)**
+
+1. **VNA SWIM Client** gửi eFPL (FIXM XML) đến:
+
+   ```
+   https://swim.vatm.vn/services/FilingService
+   ```
+2. **SWIM Gateway** xác thực chứng chỉ X.509 (mutual TLS)
+   → kiểm tra chữ ký WS-Security.
+3. Gateway chuyển message tới **Filing Service node** đang hoạt động.
+4. **Filing Service**:
+
+   * Parse XML (FIXM 4.2)
+   * Validate
+   * Ghi dữ liệu vào PostgreSQL
+   * Sinh ACK/NACK response
+5. **Response** được đẩy ngược qua Gateway → SWIM Client → hiển thị tại airline dispatcher.
+
+---
+
+## ⚙️ 6. **Kịch bản khi có 3 server:**
+
+| Server                | Thành phần chạy                        | Vai trò khi vận hành |
+| --------------------- | -------------------------------------- | -------------------- |
+| #1 (Hà Nội)           | Filing Service + SWIM Gateway          | Primary node         |
+| #2 (TP.HCM)           | Planning Service + SWIM Gateway backup | Secondary node       |
+| #3 (Database cluster) | PostgreSQL + Redis cache               | Shared backend       |
+
+**Khi một node FS bị lỗi:**
+→ Gateway tự động route request sang node còn lại (active-active hoặc active-standby).
+
+---
+
+## 🧭 7. **Kết nối thực tế giữa Airlines và VATM**
+
+| Thành phần                    | Giao thức                         | Cơ chế bảo mật             | Mục tiêu                 |
+| ----------------------------- | --------------------------------- | -------------------------- | ------------------------ |
+| SWIM Client ↔ SWIM Gateway    | HTTPS (TLS 1.3) / SOAP over HTTPS | Mutual X.509 + WS-Security | Trao đổi điện văn FF-ICE |
+| SWIM Gateway ↔ FFICER1        | Internal REST/AMQP                | JWT token nội bộ           | Service routing          |
+| FFICER1 ↔ Database            | JDBC/SSL                          | TLS encrypted              | Lưu eFPL, logs           |
+| FFICER1 ↔ Airlines (Response) | SOAP/HTTPS                        | WS-Security + ACK/NACK     | Trả kết quả              |
+
+---
+
+## 🧩 8. **Nếu nhiều hãng bay cùng truy cập?**
+
+* Mỗi hãng sẽ có **certificate riêng** do VATM cấp (hoặc CAAV ký).
+* Mỗi hãng dùng **API key hoặc WS-Policy** gắn trên request.
+* Gateway kiểm tra → định danh hãng → ủy quyền (authorization).
+* Tất cả truy cập chung endpoint, không cần 3 địa chỉ khác nhau.
+
+---
+
+## ✅ **Tóm lại:**
+
+| Câu hỏi                                 | Trả lời                                                                                                               |
+| --------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| Database đặt ở đâu?                     | Tại VATM (Primary ở Hà Nội, Replica ở TP.HCM)                                                                         |
+| FFICER1 đặt ở đâu?                      | Cũng tại VATM, chạy trên 2 server ứng dụng riêng biệt                                                                 |
+| Airlines kết nối thế nào?               | Qua SWIM Client (HTTPS/SOAP) đến SWIM Gateway của VATM                                                                |
+| Có phải kết nối trực tiếp đến 3 server? | ❌ Không. Airlines chỉ thấy 1 SWIM endpoint (Gateway). Gateway định tuyến tới 1 trong 2 node FFICER1; DB không public. |
+
+---
+
+Nếu bạn muốn, tôi có thể vẽ **Mermaid diagram mô tả chính xác kết nối giữa Airlines ↔ SWIM Gateway ↔ FFICER1 Cluster ↔ Database** (bao gồm cả load balancing và replica).
+Bạn có muốn tôi vẽ sơ đồ đó không?
+
+Rất chính xác 👏 — đây là bước **thiết kế lõi dữ liệu** (core data model) cho **FFICER1** — tức là 2 dịch vụ bắt buộc của **FF-ICE/R1**:
+
+* **Filing Service** (nộp eFPL chính thức)
+* **Planning Service** (tính toán, quản lý kế hoạch bay)
+
+Bỏ qua phần bảo mật (API key, JWT, logs...), ta chỉ cần **tập trung vào dữ liệu nghiệp vụ (flight data)**.
+
+---
+
+## 🧩 **1. Tổng thể Database cần cho FFICER1**
+
+> Mục tiêu: Duy trì đầy đủ vòng đời của một kế hoạch bay eFPL (từ airline gửi đến VATM validate → approve → distribute).
+
+### Tối thiểu gồm **7 bảng chính** + **2 bảng tham chiếu**.
+
+| Loại       | Bảng                 | Mục đích                                                   |
+| ---------- | -------------------- | ---------------------------------------------------------- |
+| Chính      | `flight_plans`       | Lưu toàn bộ thông tin eFPL (FIXM core)                     |
+| Chính      | `flight_events`      | Ghi nhận trạng thái và hành động (FILED, APPROVED, CNL...) |
+| Chính      | `planned_trajectory` | Dữ liệu 4D (latitude, longitude, altitude, time)           |
+| Chính      | `route_segments`     | Chuỗi tuyến đường (airways / waypoints)                    |
+| Chính      | `planning_requests`  | Dữ liệu Planning Service (route request, proposal)         |
+| Chính      | `planning_results`   | Đề xuất route/trajectory trả về                            |
+| Chính      | `ack_messages`       | Lưu ACK/NACK/Reason code của Filing Service                |
+| Tham chiếu | `aircraft_types`     | Mô tả loại máy bay (A321, B737…)                           |
+| Tham chiếu | `airports`           | Danh sách sân bay 4 chữ ICAO (VVNB, VVTS...)               |
+
+---
+
+## 🗂️ **2. Chi tiết từng bảng**
+
+### 🟢 `flight_plans` — **bảng trung tâm**
+
+```sql
+CREATE TABLE flight_plans (
+    gufi                VARCHAR(50) PRIMARY KEY,          -- Globally Unique Flight Identifier
+    flight_number       VARCHAR(10) NOT NULL,
+    airline_code        VARCHAR(3) NOT NULL,
+    aircraft_registration VARCHAR(10),
+    aircraft_type       VARCHAR(10),
+    departure_airport   VARCHAR(4) NOT NULL,
+    arrival_airport     VARCHAR(4) NOT NULL,
+    alternate_airports  VARCHAR(20),
+    estimated_departure TIMESTAMP WITH TIME ZONE,
+    estimated_arrival   TIMESTAMP WITH TIME ZONE,
+    flight_rules        VARCHAR(1) DEFAULT 'I',           -- I/V (IFR/VFR)
+    flight_type         VARCHAR(1) DEFAULT 'S',           -- S/N (Scheduled/Non-scheduled)
+    cruise_speed        INTEGER,
+    cruise_altitude     INTEGER,
+    route_text          TEXT,
+    total_estimated_elapsed INTERVAL,
+    flight_status       VARCHAR(20) DEFAULT 'FILED',      -- FILED, APPROVED, REJECTED, ACTIVE, COMPLETED
+    remarks             TEXT,
+    fixm_data           JSONB,                            -- entire FIXM eFPL message (optional)
+    created_at          TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at          TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+```
+
+---
+
+### 🟢 `flight_events` — **lịch sử và trạng thái**
+
+```sql
+CREATE TABLE flight_events (
+    id             BIGSERIAL PRIMARY KEY,
+    gufi           VARCHAR(50) REFERENCES flight_plans(gufi) ON DELETE CASCADE,
+    event_type     VARCHAR(30),   -- FILED, VALIDATED, APPROVED, REJECTED, UPDATED, CANCELLED
+    event_time     TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    event_details  TEXT,
+    source_system  VARCHAR(50),   -- e.g. VATM-FILING, AIRLINE-SWIM
+    operator       VARCHAR(50)
+);
+```
+
+💡 Bảng này giúp **truy vết toàn bộ lifecycle của eFPL**, cực kỳ quan trọng cho kiểm soát nghiệp vụ (tương đương “logics trace”).
+
+---
+
+### 🟢 `planned_trajectory` — **4D trajectory**
+
+```sql
+CREATE TABLE planned_trajectory (
+    id            BIGSERIAL PRIMARY KEY,
+    gufi          VARCHAR(50) REFERENCES flight_plans(gufi) ON DELETE CASCADE,
+    seq_num       INTEGER,
+    waypoint      VARCHAR(10),
+    latitude      DECIMAL(10,6),
+    longitude     DECIMAL(10,6),
+    altitude_ft   INTEGER,
+    time_utc      TIMESTAMP WITH TIME ZONE,
+    speed_kts     INTEGER
+);
+```
+
+➡️ Mỗi eFPL có nhiều điểm trajectory → phục vụ Planning Service & conflict detection.
+
+---
+
+### 🟢 `route_segments` — **chi tiết đường bay**
+
+```sql
+CREATE TABLE route_segments (
+    id            BIGSERIAL PRIMARY KEY,
+    gufi          VARCHAR(50) REFERENCES flight_plans(gufi) ON DELETE CASCADE,
+    from_waypoint VARCHAR(10),
+    to_waypoint   VARCHAR(10),
+    airway        VARCHAR(10),
+    distance_nm   DECIMAL(6,2),
+    min_alt_ft    INTEGER,
+    max_alt_ft    INTEGER
+);
+```
+
+➡️ Dễ phân tích khi kiểm tra route feasibility, hoặc tái sử dụng cho Planning Service.
+
+---
+
+### 🟢 `planning_requests` — **yêu cầu từ airline (Planning Service)**
+
+```sql
+CREATE TABLE planning_requests (
+    id             BIGSERIAL PRIMARY KEY,
+    request_id     VARCHAR(50) UNIQUE,
+    airline_code   VARCHAR(3),
+    aircraft_type  VARCHAR(10),
+    departure_airport VARCHAR(4),
+    arrival_airport   VARCHAR(4),
+    departure_time TIMESTAMP WITH TIME ZONE,
+    constraints    JSONB,      -- weather, NOTAM, slot, etc.
+    created_at     TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+```
+
+---
+
+### 🟢 `planning_results` — **đề xuất trả về (Planning Service)**
+
+```sql
+CREATE TABLE planning_results (
+    id             BIGSERIAL PRIMARY KEY,
+    request_id     VARCHAR(50) REFERENCES planning_requests(request_id) ON DELETE CASCADE,
+    proposed_gufi  VARCHAR(50),
+    proposed_route TEXT,
+    estimated_elapsed INTERVAL,
+    trajectory_json JSONB,      -- route in 4D points
+    generated_at   TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+```
+
+---
+
+### 🟢 `ack_messages` — **trả ACK/NACK của Filing Service**
+
+```sql
+CREATE TABLE ack_messages (
+    id             BIGSERIAL PRIMARY KEY,
+    gufi           VARCHAR(50) REFERENCES flight_plans(gufi) ON DELETE CASCADE,
+    ack_type       VARCHAR(10),     -- ACK, NACK
+    reason_code    VARCHAR(20),     -- e.g. INVALID_SCHEMA, DUPLICATE_GUFI, ROUTE_CONFLICT
+    reason_detail  TEXT,
+    sent_time      TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    correlation_id VARCHAR(50)
+);
+```
+
+---
+
+### 🔵 `aircraft_types` — **tham chiếu loại máy bay**
+
+```sql
+CREATE TABLE aircraft_types (
+    code          VARCHAR(10) PRIMARY KEY,
+    manufacturer  VARCHAR(50),
+    model         VARCHAR(50),
+    category      VARCHAR(20),
+    max_passengers INTEGER
+);
+```
+
+---
+
+### 🔵 `airports` — **tham chiếu sân bay**
+
+```sql
+CREATE TABLE airports (
+    icao_code     VARCHAR(4) PRIMARY KEY,
+    iata_code     VARCHAR(3),
+    name          VARCHAR(100),
+    city          VARCHAR(50),
+    latitude      DECIMAL(10,6),
+    longitude     DECIMAL(11,6)
+);
+```
+
+---
+
+## 🧮 **3. Quan hệ tổng thể giữa các bảng**
+
+```mermaid
+erDiagram
+    flight_plans ||--o{ flight_events : has
+    flight_plans ||--o{ planned_trajectory : contains
+    flight_plans ||--o{ route_segments : includes
+    planning_requests ||--o{ planning_results : generates
+    flight_plans ||--o{ ack_messages : produces
+    flight_plans }o--|| airports : departs_from
+    flight_plans }o--|| airports : arrives_to
+    flight_plans }o--|| aircraft_types : uses
+```
+
+---
+
+## 🚀 **4. Tối thiểu cần gì để hệ thống chạy được**
+
+| Thành phần                               | Mục tiêu                        | Bắt buộc? |
+| ---------------------------------------- | ------------------------------- | --------- |
+| `flight_plans`                           | eFPL lưu trữ chính              | ✅         |
+| `flight_events`                          | Lịch sử xử lý                   | ✅         |
+| `ack_messages`                           | Trả ACK/NACK                    | ✅         |
+| `planned_trajectory`                     | Route 4D (cho Planning Service) | ✅         |
+| `planning_requests` / `planning_results` | Tương tác Planning Service      | ✅         |
+| `aircraft_types` / `airports`            | Tham chiếu chuẩn hóa FIXM       | ✅         |
+
+➡️ Tổng cộng **7 bảng chính + 2 bảng tham chiếu**,
+đủ để vận hành **Filing Service + Planning Service** theo chuẩn ICAO Doc 9965 (FF-ICE/R1).
+
+---
+
+## 📦 **5. Gợi ý thực tế cho triển khai tại VATM**
+
+* **PostgreSQL** làm DBMS (vì FIXM hỗ trợ tốt JSONB/XML)
+* Dùng **schema “fficer1”** tách riêng trong DB cluster
+* Index GUFI, flight_date, departure_airport, arrival_airport
+* Mỗi eFPL có **JSON FIXM** lưu nguyên vẹn → dễ share qua SWIM Query Service sau này
+* Lưu `trajectory_json` để mở rộng sang **Trial Request / Update Service** về sau
+
+---
+
+Nếu bạn muốn, tôi có thể giúp **tạo SQL script hoàn chỉnh** (PostgreSQL) để bạn chạy luôn trên server — chỉ chứa các bảng này (không có bảo mật).
+Bạn có muốn tôi sinh file `.sql` đó cho bạn không?
+
+---
+
+
 ```mermaid
 ---
 config:
